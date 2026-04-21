@@ -17,7 +17,7 @@ use tracing::instrument;
 use crate::{
     policy::{ErrorAction, ExitAction, FailureAction, RestartPolicy, ServicePolicy},
     readiness::{ReadinessMode, ReadinessTracker, ReadySignal, SupervisorReadiness},
-    service::{BoxFuture, ServiceOutcome, SupervisedService},
+    service::{BoxFuture, ServiceError, ServiceOutcome, SupervisedService},
 };
 
 /// Extracts a service-local context from the supervisor's root state.
@@ -83,6 +83,15 @@ impl<C> Context<C> {
 
     pub fn token(&self) -> &CancellationToken {
         &self.token
+    }
+
+    /// Begins cooperative supervisor teardown from tests.
+    ///
+    /// Integration tests compile this crate as a normal dependency, so this is
+    /// intentionally only available to crate-local unit tests.
+    #[cfg(test)]
+    pub(crate) fn begin_teardown(&self) {
+        self.token.cancel();
     }
 
     pub fn readiness(&self) -> &ReadySignal {
@@ -271,6 +280,16 @@ impl<S> SupervisorBuilder<S> {
         self
     }
 
+    /// Registers a Ctrl+C listener that begins supervisor shutdown when fired.
+    ///
+    /// The listener is an ordinary, immediately-ready supervised service. If
+    /// another service stops the supervisor first, the listener exits through
+    /// the supervisor cancellation token.
+    pub fn shutdown_on_ctrl_c(mut self) -> Self {
+        self.registrations.push(Registration::ctrl_c());
+        self
+    }
+
     /// Registers a [`SupervisedService`] using context extracted from the root
     /// state via [`FromSupervisorState`], the builder's default
     /// [`RestartPolicy`], and [`ExitAction::Ignore`] for normal completion.
@@ -427,9 +446,7 @@ impl Supervisor {
                     },
                     ServiceOutcome::Cancelled => {},
                     ServiceOutcome::RequestedShutdown => {
-                        shutdown = Some(ShutdownCause::ServiceRequested {
-                            service: state.registration.name,
-                        });
+                        shutdown = Some(state.registration.shutdown_request.cause());
                         root.cancel();
                     },
                     ServiceOutcome::Error(_) => {
@@ -479,6 +496,7 @@ struct Registration {
     name: &'static str,
     policy: ServicePolicy,
     readiness: ReadinessMode,
+    shutdown_request: ShutdownRequest,
     runner: Arc<dyn Runner>,
 }
 
@@ -487,15 +505,36 @@ impl Registration {
     where
         S: SupervisedService,
     {
+        let name = service.name();
+
         Self {
-            name: service.name(),
+            name,
             policy,
             readiness,
+            shutdown_request: ShutdownRequest::Service { service: name },
             runner: Arc::new(ServiceRunner {
                 service: Arc::new(service),
                 ctx,
             }),
         }
+    }
+
+    fn ctrl_c() -> Self {
+        Self::new(
+            CtrlC,
+            (),
+            ServicePolicy::new(
+                ExitAction::Shutdown,
+                RestartPolicy::never(ErrorAction::Shutdown),
+            ),
+            ReadinessMode::Immediate,
+        )
+        .with_shutdown_request(ShutdownRequest::Signal)
+    }
+
+    fn with_shutdown_request(mut self, shutdown_request: ShutdownRequest) -> Self {
+        self.shutdown_request = shutdown_request;
+        self
     }
 
     fn run(
@@ -505,6 +544,45 @@ impl Registration {
         restart_delay: Option<Duration>,
     ) -> BoxFuture<ServiceOutcome> {
         self.runner.run(token, readiness, restart_delay)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ShutdownRequest {
+    Service { service: &'static str },
+    Signal,
+}
+
+impl ShutdownRequest {
+    fn cause(self) -> ShutdownCause {
+        match self {
+            Self::Service { service } => ShutdownCause::ServiceRequested { service },
+            Self::Signal => ShutdownCause::Signal,
+        }
+    }
+}
+
+struct CtrlC;
+
+impl SupervisedService for CtrlC {
+    type Context = ();
+
+    fn name(&self) -> &'static str {
+        "ctrl-c"
+    }
+
+    fn run(&self, ctx: Context<Self::Context>) -> BoxFuture<ServiceOutcome> {
+        let token = ctx.token().clone();
+        Box::pin(async move {
+            match token
+                .run_until_cancelled_owned(tokio::signal::ctrl_c())
+                .await
+            {
+                Some(Ok(())) => ServiceOutcome::requested_shutdown(),
+                Some(Err(error)) => ServiceOutcome::failed(ServiceError::from_error(error)),
+                None => ServiceOutcome::cancelled(),
+            }
+        })
     }
 }
 
@@ -731,4 +809,53 @@ pub enum Error {
     UnknownTask { task_id: String },
     #[error("received an out-of-range service index {index} from supervisor bookkeeping")]
     UnknownServiceIndex { index: usize },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{future, time::Duration};
+
+    use tokio::time::timeout;
+
+    use super::{Context, ServiceOutcome, ShutdownCause, ShutdownRequest, SupervisorBuilder};
+    use crate::{service_fn, ServiceExt};
+
+    #[test]
+    fn signal_shutdown_request_maps_to_signal_cause() {
+        assert_eq!(ShutdownRequest::Signal.cause(), ShutdownCause::Signal);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn context_test_teardown_cancels_running_services() {
+        let summary = timeout(
+            Duration::from_secs(2),
+            SupervisorBuilder::new(())
+                .shutdown_on_ctrl_c()
+                .add(
+                    service_fn("loop", |_ctx: Context<()>| {
+                        future::pending::<ServiceOutcome>()
+                    })
+                    .until_cancelled(),
+                )
+                .add(service_fn("teardown", |ctx: Context<()>| async move {
+                    ctx.begin_teardown();
+                    ServiceOutcome::completed()
+                }))
+                .build()
+                .run(),
+        )
+        .await
+        .expect("teardown should stop the supervisor")
+        .expect("supervisor should run");
+
+        assert_eq!(summary.shutdown_cause(), &ShutdownCause::Completed);
+        assert_eq!(
+            summary.service("loop").expect("loop summary").outcome(),
+            &ServiceOutcome::Cancelled
+        );
+        assert_eq!(
+            summary.service("ctrl-c").expect("ctrl-c summary").outcome(),
+            &ServiceOutcome::Cancelled
+        );
+    }
 }

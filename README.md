@@ -10,6 +10,7 @@ The crate is intentionally compact:
 - `service_fn` wraps one-off async functions as services.
 - `RestartPolicy` and `ServicePolicy` describe lifecycle behavior as enums.
 - `.until_cancelled()` and `.when_ready()` are fluent service adapters.
+- `.shutdown_on_ctrl_c()` adds an immediately-ready Ctrl+C shutdown listener.
 - `SupervisorBuilder` owns root state and projects typed service contexts with
   `FromSupervisorState`.
 
@@ -28,6 +29,7 @@ struct App {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), supervised::Error> {
     let summary = SupervisorBuilder::new(App { name: "bar" })
+        .shutdown_on_ctrl_c()
         .add(
             service_fn("worker", |ctx: Context<App>| async move {
                 tracing::info!(app = ctx.ctx().name, "worker started");

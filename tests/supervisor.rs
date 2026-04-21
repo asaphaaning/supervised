@@ -702,3 +702,28 @@ async fn options_can_override_service_readiness() {
     );
     assert_eq!(summary.readiness(), SupervisorReadiness::Pending);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn ctrl_c_listener_is_immediately_ready_and_cancelled_by_other_shutdown() {
+    let summary = SupervisorBuilder::new(())
+        .shutdown_on_ctrl_c()
+        .add(service_fn("shutdown", |_ctx: Context<()>| async move {
+            ServiceOutcome::requested_shutdown()
+        }))
+        .build()
+        .run()
+        .await
+        .expect("supervisor should run");
+
+    assert_eq!(summary.readiness(), SupervisorReadiness::Ready);
+    assert_eq!(
+        summary.service("ctrl-c").expect("ctrl-c summary").outcome(),
+        &ServiceOutcome::Cancelled
+    );
+    assert_eq!(
+        summary.shutdown_cause(),
+        &ShutdownCause::ServiceRequested {
+            service: "shutdown",
+        }
+    );
+}
