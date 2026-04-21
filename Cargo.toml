@@ -1,0 +1,53 @@
+[package]
+authors = [ "Frederik Haaning <fh@frederikhaaning.dk>" ]
+categories = [ "asynchronous", "concurrency" ]
+description = "Typed supervision for long-lived Tokio services."
+documentation = "https://docs.rs/supervised"
+edition = "2021"
+include = [
+  "src/**/*.rs",
+  "tests/**/*.rs",
+  "Cargo.toml",
+  "README.md",
+  "LICENSE-*",
+]
+keywords = [ "supervision", "tokio", "services", "async" ]
+license = "MIT OR Apache-2.0"
+name = "supervised"
+readme = "README.md"
+rust-version = "1.75"
+version = "0.1.0"
+
+[lints.rust]
+unsafe_code     = "forbid"
+unused_must_use = "deny"
+
+[lints.clippy]
+all                    = { level = "warn", priority = -1 }
+dbg_macro              = "deny"
+expect_used            = "deny"
+panic                  = "deny"
+should_implement_trait = "allow"
+todo                   = "deny"
+unimplemented          = "deny"
+unreachable            = "deny"
+unwrap_used            = "deny"
+wildcard_imports       = "deny"
+
+[dependencies]
+thiserror = "2"
+tokio = { version = "1.44", default-features = false, features = [
+  "rt",
+  "time",
+  "sync",
+] }
+tokio-util = { version = "0.7", default-features = false }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.44", default-features = false, features = [
+  "rt",
+  "macros",
+  "time",
+  "sync",
+] }
