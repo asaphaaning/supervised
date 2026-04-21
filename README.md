@@ -51,6 +51,12 @@ async fn main() -> Result<(), supervised::Error> {
 }
 ```
 
+Use `.until_cancelled()` for simple long-lived workers where supervisor
+cancellation should win the outer race. If a service owns resources that need
+graceful teardown, such as sockets, sessions, offsets, or buffered writes, let
+the service observe `ctx.token().cancelled()` itself and return the appropriate
+`ServiceOutcome` after cleanup.
+
 ## External cancellation
 
 Brought your own `CancellationToken`? No problem. Bridge it into the
