@@ -51,6 +51,35 @@ async fn main() -> Result<(), supervised::Error> {
 }
 ```
 
+## External cancellation
+
+Brought your own `CancellationToken`? No problem. Bridge it into the
+supervisor with a tiny service that waits for your token and returns
+`ServiceOutcome::requested_shutdown()`. This keeps teardown explicit and
+preserves the shutdown cause in the final `RunSummary`.
+
+```rust
+use supervised::{Context, ServiceOutcome, SupervisorBuilder, service_fn};
+use tokio_util::sync::CancellationToken;
+
+async fn run(external_token: CancellationToken) -> Result<(), supervised::Error> {
+let supervisor = SupervisorBuilder::new(())
+    .add(service_fn("shutdown", move |_ctx: Context<()>| {
+        let token = external_token.clone();
+
+        async move {
+            token.cancelled().await;
+            ServiceOutcome::requested_shutdown()
+        }
+    }))
+    .build();
+
+let _summary = supervisor.run().await?;
+
+Ok(())
+}
+```
+
 ## Readiness
 
 Services are ready immediately by default. Use `.when_ready()` when startup
@@ -58,8 +87,9 @@ should block aggregate readiness until the service explicitly calls
 `ctx.readiness().mark_ready()` or completes successfully.
 
 ```rust
-# use supervised::{Context, ServiceExt, ServiceOutcome, SupervisorBuilder, service_fn};
-# async fn run() -> Result<(), supervised::Error> {
+use supervised::{Context, ServiceExt, ServiceOutcome, SupervisorBuilder, service_fn};
+
+async fn run() -> Result<(), supervised::Error> {
 let supervisor = SupervisorBuilder::new(())
     .add(
         service_fn("cache", |ctx: Context<()>| async move {
@@ -70,9 +100,11 @@ let supervisor = SupervisorBuilder::new(())
         .when_ready(),
     )
     .build();
-# let _ = supervisor.run().await?;
-# Ok(())
-# }
+
+let _summary = supervisor.run().await?;
+
+Ok(())
+}
 ```
 
 ## License
