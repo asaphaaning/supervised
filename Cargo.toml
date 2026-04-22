@@ -8,6 +8,7 @@ include = [
   "src/**/*.rs",
   "tests/**/*.rs",
   "Cargo.toml",
+  "CHANGELOG.md",
   "README.md",
   "LICENSE-*",
 ]
@@ -16,7 +17,7 @@ license = "MIT OR Apache-2.0"
 name = "supervised"
 readme = "README.md"
 rust-version = "1.75"
-version = "0.2.0"
+version = "0.3.0"
 
 [lints.rust]
 unsafe_code     = "forbid"

@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used)]
 
 use std::{
+    convert::Infallible,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -15,9 +16,11 @@ use supervised::{
     ErrorAction,
     ExitAction,
     FromSupervisorState,
+    IntoServiceOutcome,
     Options,
     ReadinessMode,
     RestartPolicy,
+    ServiceError,
     ServiceExt,
     ServiceOutcome,
     ServicePolicy,
@@ -72,6 +75,12 @@ impl SupervisedService for ManualReadyService {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum DemoError {
+    #[error("demo service failed")]
+    Failed,
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn completes_without_shutdown_request() {
     let summary = SupervisorBuilder::new(())
@@ -90,6 +99,151 @@ async fn completes_without_shutdown_request() {
             .service("complete")
             .expect("service summary")
             .outcome(),
+        &ServiceOutcome::Completed
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn service_fn_unit_output_maps_to_completed() {
+    let summary = SupervisorBuilder::new(())
+        .add(service_fn("unit", |_ctx: Context<()>| async move {}))
+        .build()
+        .run()
+        .await
+        .expect("supervisor should run");
+
+    assert_eq!(summary.shutdown_cause(), &ShutdownCause::Completed);
+    assert_eq!(
+        summary.service("unit").expect("unit summary").outcome(),
+        &ServiceOutcome::Completed
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn service_fn_result_unit_ok_maps_to_completed() {
+    let summary = SupervisorBuilder::new(())
+        .add(service_fn("fallible", |_ctx: Context<()>| async move {
+            Ok::<(), DemoError>(())
+        }))
+        .build()
+        .run()
+        .await
+        .expect("supervisor should run");
+
+    assert_eq!(summary.shutdown_cause(), &ShutdownCause::Completed);
+    assert_eq!(
+        summary
+            .service("fallible")
+            .expect("fallible summary")
+            .outcome(),
+        &ServiceOutcome::Completed
+    );
+}
+
+#[test]
+fn infallible_is_a_service_outcome() {
+    fn assert_outcome<T: IntoServiceOutcome>() {}
+
+    assert_outcome::<Infallible>();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn service_fn_result_preserves_explicit_success_outcome() {
+    let summary = SupervisorBuilder::new(())
+        .add(service_fn("shutdown", |_ctx: Context<()>| async move {
+            Ok::<ServiceOutcome, DemoError>(ServiceOutcome::requested_shutdown())
+        }))
+        .build()
+        .run()
+        .await
+        .expect("supervisor should run");
+
+    assert_eq!(
+        summary.shutdown_cause(),
+        &ShutdownCause::ServiceRequested {
+            service: "shutdown"
+        }
+    );
+    assert_eq!(
+        summary
+            .service("shutdown")
+            .expect("shutdown summary")
+            .outcome(),
+        &ServiceOutcome::RequestedShutdown
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn service_fn_result_error_maps_to_service_error() {
+    let summary = SupervisorBuilder::new(())
+        .add(service_fn("observer", |ctx: Context<()>| async move {
+            ctx.token().cancelled().await;
+            ServiceOutcome::cancelled()
+        }))
+        .add(service_fn("fatal", |_ctx: Context<()>| async move {
+            Err::<(), DemoError>(DemoError::Failed)
+        }))
+        .build()
+        .run()
+        .await
+        .expect("supervisor should run");
+
+    assert_eq!(
+        summary.shutdown_cause(),
+        &ShutdownCause::FatalService { service: "fatal" }
+    );
+    assert_eq!(
+        summary.service("fatal").expect("fatal summary").outcome(),
+        &ServiceOutcome::Error(ServiceError::new("demo service failed"))
+    );
+    assert_eq!(
+        summary
+            .service("observer")
+            .expect("observer summary")
+            .outcome(),
+        &ServiceOutcome::Cancelled
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn service_fn_result_service_error_maps_directly() {
+    let summary = SupervisorBuilder::new(())
+        .add(service_fn("fatal", |_ctx: Context<()>| async move {
+            Err::<(), ServiceError>(ServiceError::new("direct failure"))
+        }))
+        .build()
+        .run()
+        .await
+        .expect("supervisor should run");
+
+    assert_eq!(
+        summary.shutdown_cause(),
+        &ShutdownCause::FatalService { service: "fatal" }
+    );
+    assert_eq!(
+        summary.service("fatal").expect("fatal summary").outcome(),
+        &ServiceOutcome::Error(ServiceError::new("direct failure"))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn startup_gated_result_unit_completion_counts_as_ready() {
+    let summary = SupervisorBuilder::new(())
+        .add(
+            service_fn("gate", |_ctx: Context<()>| async move {
+                Ok::<(), DemoError>(())
+            })
+            .when_ready(),
+        )
+        .build()
+        .run()
+        .await
+        .expect("supervisor should run");
+
+    assert_eq!(summary.shutdown_cause(), &ShutdownCause::Completed);
+    assert_eq!(summary.readiness(), SupervisorReadiness::Ready);
+    assert_eq!(
+        summary.service("gate").expect("gate summary").outcome(),
         &ServiceOutcome::Completed
     );
 }

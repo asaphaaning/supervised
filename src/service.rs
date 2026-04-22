@@ -1,5 +1,5 @@
 //! Supervised service vocabulary and adapters.
-use std::{fmt, future::Future, pin::Pin, sync::Arc};
+use std::{convert::Infallible, error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
 use crate::{readiness::ReadinessMode, Context};
 
@@ -90,6 +90,72 @@ impl From<&str> for ServiceError {
     }
 }
 
+/// Converts fallible service errors into [`ServiceError`].
+///
+/// This trait keeps [`service_fn`] ergonomic for module-local error enums
+/// while preserving [`ServiceOutcome`] as the supervisor runtime boundary.
+pub trait IntoServiceError {
+    /// Converts `self` into the stable service error payload used in summaries.
+    fn into_service_error(self) -> ServiceError;
+}
+
+impl IntoServiceError for ServiceError {
+    fn into_service_error(self) -> ServiceError {
+        self
+    }
+}
+
+impl<E> IntoServiceError for E
+where
+    E: Error + Send + Sync + 'static,
+{
+    fn into_service_error(self) -> ServiceError {
+        ServiceError::from_error(self)
+    }
+}
+
+/// Converts function-backed service return values into [`ServiceOutcome`].
+///
+/// Concrete [`SupervisedService`] implementations still return
+/// [`ServiceOutcome`] directly. This trait is intentionally used by
+/// [`service_fn`] so one-off async functions can use natural signatures like
+/// `Result<(), Error>` without widening the core service trait.
+pub trait IntoServiceOutcome {
+    /// Converts `self` into the terminal outcome observed by the supervisor.
+    fn into_service_outcome(self) -> ServiceOutcome;
+}
+
+impl IntoServiceOutcome for ServiceOutcome {
+    fn into_service_outcome(self) -> ServiceOutcome {
+        self
+    }
+}
+
+impl IntoServiceOutcome for () {
+    fn into_service_outcome(self) -> ServiceOutcome {
+        ServiceOutcome::Completed
+    }
+}
+
+impl IntoServiceOutcome for Infallible {
+    fn into_service_outcome(self) -> ServiceOutcome {
+        match self {}
+    }
+}
+
+impl<T, E> IntoServiceOutcome for Result<T, E>
+where
+    T: IntoServiceOutcome,
+    E: IntoServiceError,
+{
+    fn into_service_outcome(self) -> ServiceOutcome {
+        match self {
+            Ok(outcome) => outcome.into_service_outcome(),
+            Err(error) => ServiceOutcome::Error(error.into_service_error()),
+        }
+    }
+}
+
 /// Long-lived async subsystem owned by the supervisor.
 ///
 /// A [`SupervisedService`] gets a typed [`Context`] and returns a
@@ -159,11 +225,12 @@ impl<C, F> FnService<C, F> {
 /// context. With a stateful builder, that usually means:
 /// - `Context<AppState>` when the service wants the full root state
 /// - `Context<Subset>` when `Subset: FromSupervisorState<AppState>`
-pub fn service_fn<C, F, Fut>(name: &'static str, run: F) -> FnService<C, F>
+pub fn service_fn<C, F, Fut, O>(name: &'static str, run: F) -> FnService<C, F>
 where
     C: Clone + Send + Sync + 'static,
     F: Fn(Context<C>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = ServiceOutcome> + Send + 'static,
+    Fut: Future<Output = O> + Send + 'static,
+    O: IntoServiceOutcome + Send + 'static,
 {
     FnService {
         name,
@@ -172,11 +239,12 @@ where
     }
 }
 
-impl<C, F, Fut> SupervisedService for FnService<C, F>
+impl<C, F, Fut, O> SupervisedService for FnService<C, F>
 where
     C: Clone + Send + Sync + 'static,
     F: Fn(Context<C>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = ServiceOutcome> + Send + 'static,
+    Fut: Future<Output = O> + Send + 'static,
+    O: IntoServiceOutcome + Send + 'static,
 {
     type Context = C;
 
@@ -185,7 +253,8 @@ where
     }
 
     fn run(&self, ctx: Context<Self::Context>) -> BoxFuture<ServiceOutcome> {
-        Box::pin((self.run)(ctx))
+        let future = (self.run)(ctx);
+        Box::pin(async move { future.await.into_service_outcome() })
     }
 }
 

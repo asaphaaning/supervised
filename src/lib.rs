@@ -25,6 +25,8 @@ pub use service::{
     when_ready,
     BoxFuture,
     FnService,
+    IntoServiceError,
+    IntoServiceOutcome,
     ServiceError,
     ServiceExt,
     ServiceOutcome,

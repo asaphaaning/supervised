@@ -34,7 +34,7 @@ async fn main() -> Result<(), supervised::Error> {
             service_fn("worker", |ctx: Context<App>| async move {
                 tracing::info!(app = ctx.ctx().name, "worker started");
 
-                std::future::pending::<ServiceOutcome>().await
+                std::future::pending::<()>().await
             })
             .until_cancelled(),
         )
@@ -50,6 +50,11 @@ async fn main() -> Result<(), supervised::Error> {
     Ok(())
 }
 ```
+
+`service_fn` accepts natural async return shapes and converts them into a
+`ServiceOutcome`: `()` means completed, `Result<(), E>` means completed or
+failed, and `Result<ServiceOutcome, E>` lets a service keep returning explicit
+outcomes when needed.
 
 Use `.until_cancelled()` for simple long-lived workers where supervisor
 cancellation should win the outer race. If a service owns resources that need
@@ -69,20 +74,20 @@ use supervised::{Context, ServiceOutcome, SupervisorBuilder, service_fn};
 use tokio_util::sync::CancellationToken;
 
 async fn run(external_token: CancellationToken) -> Result<(), supervised::Error> {
-let supervisor = SupervisorBuilder::new(())
-    .add(service_fn("shutdown", move |_ctx: Context<()>| {
-        let token = external_token.clone();
+    let supervisor = SupervisorBuilder::new(())
+        .add(service_fn("shutdown", move |_ctx: Context<()>| {
+            let token = external_token.clone();
 
-        async move {
-            token.cancelled().await;
-            ServiceOutcome::requested_shutdown()
-        }
-    }))
-    .build();
+            async move {
+                token.cancelled().await;
+                ServiceOutcome::requested_shutdown()
+            }
+        }))
+        .build();
 
-let _summary = supervisor.run().await?;
+    let _summary = supervisor.run().await?;
 
-Ok(())
+    Ok(())
 }
 ```
 
@@ -93,23 +98,25 @@ should block aggregate readiness until the service explicitly calls
 `ctx.readiness().mark_ready()` or completes successfully.
 
 ```rust
-use supervised::{Context, ServiceExt, ServiceOutcome, SupervisorBuilder, service_fn};
+use supervised::{Context, ServiceExt, SupervisorBuilder, service_fn};
 
 async fn run() -> Result<(), supervised::Error> {
-let supervisor = SupervisorBuilder::new(())
-    .add(
-        service_fn("cache", |ctx: Context<()>| async move {
-            // Warm the cache here.
-            ctx.readiness().mark_ready();
-            ServiceOutcome::completed()
-        })
-        .when_ready(),
-    )
-    .build();
+    let supervisor = SupervisorBuilder::new(())
+        .add(
+            service_fn("cache", |ctx: Context<()>| async move {
+                // Warm the cache here.
+                std::fs::read_to_string("/etc/hostname")?;
+                ctx.readiness().mark_ready();
 
-let _summary = supervisor.run().await?;
+                Ok::<(), std::io::Error>(())
+            })
+            .when_ready(),
+        )
+        .build();
 
-Ok(())
+    let _summary = supervisor.run().await?;
+
+    Ok(())
 }
 ```
 
